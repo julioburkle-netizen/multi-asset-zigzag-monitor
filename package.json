@@ -1,0 +1,12 @@
+{
+  "name": "multi-asset-zigzag-monitor",
+  "version": "1.0.0",
+  "description": "Monitor ZigZag para DE40, SP500, EURUSD, Coffee y Cocoa via Yahoo Finance",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
