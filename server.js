@@ -304,7 +304,12 @@ async function poll() {
 }
 
 const server = http.createServer((req, res) => {
-  if (req.url === "/health" || req.url === "/") {
+  if (req.url === "/ping") {
+    // Endpoint liviano para UptimeRobot/cron-job.org — solo confirma que
+    // el servicio está despierto, sin el JSON pesado de /health.
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("OK");
+  } else if (req.url === "/health" || req.url === "/") {
     const estado = [];
     for (const monitor of MONITORS) {
       for (const [tfKey, cfg] of Object.entries(TF_DEFS)) {
