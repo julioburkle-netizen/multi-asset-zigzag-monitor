@@ -18,7 +18,7 @@ const HTTP_TIMEOUT_MS = 10 * 1000;
 const MONITORS = [
   { id: "de40",   pairLabel: "DAX 40 (DE40)",   yahooSymbol: "^GDAXI"   },
   { id: "sp500",  pairLabel: "S&P 500",         yahooSymbol: "^GSPC"    },
-  { id: "eurusd", pairLabel: "EUR/USD",         yahooSymbol: "EURUSD=X", pct: 0.003 },
+  { id: "eurusd", pairLabel: "EUR/USD",         yahooSymbol: "EURUSD=X", pct: 0.003, dailyAnchor: "ny17" },
   { id: "coffee", pairLabel: "Café (Coffee)",   yahooSymbol: "KC=F"     },
   { id: "cacao",  pairLabel: "Cacao (Cocoa)",   yahooSymbol: "CC=F"     },
 ];
@@ -166,9 +166,81 @@ function buildSynthetic(bucket) {
   };
 }
 
+// ── Día de trading forex: agrupa velas de 1H en días que cortan a las ──
+// 17:00 hora de Nueva York (convención estándar de forex / TradingView), ──
+// no a medianoche UTC como hace la vela diaria nativa de Yahoo. El ──
+// horario de verano de EE.UU. se maneja solo, vía Intl con timeZone. ────
+function nyTradingDayKey(utcMs) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false,
+  }).formatToParts(new Date(utcMs));
+  const get = (type) => parts.find(p => p.type === type).value;
+  let y = parseInt(get("year")), m = parseInt(get("month")), d = parseInt(get("day"));
+  let h = parseInt(get("hour"));
+  if (h === 24) h = 0;
+  const dia = new Date(Date.UTC(y, m - 1, d));
+  if (h >= 17) dia.setUTCDate(dia.getUTCDate() + 1); // a partir de las 17:00, ya es el día siguiente
+  return dia.toISOString().slice(0, 10);
+}
+
+function groupToForexDaily(hourly) {
+  const groups = [];
+  let bucket = [];
+  let claveActual = null;
+  for (const k of hourly) {
+    const clave = nyTradingDayKey(k.t);
+    if (claveActual !== null && clave !== claveActual) {
+      groups.push(buildSynthetic(bucket));
+      bucket = [];
+    }
+    claveActual = clave;
+    bucket.push(k);
+  }
+  if (bucket.length > 0) groups.push(buildSynthetic(bucket));
+  return groups;
+}
+
+// ── Velas sintéticas de 4H: agrupa de 4 en 4 las velas de 1H, cerrando ──
+// el grupo si hay un salto de tiempo grande (cierre de sesión/mercado). ──
+function groupToSynthetic4h(hourly) {
+  const groups = [];
+  let bucket = [];
+  for (const k of hourly) {
+    if (bucket.length > 0) {
+      const gapSec = (k.t - bucket[bucket.length - 1].t) / 1000;
+      if (gapSec > 3600 * 1.5) { groups.push(buildSynthetic(bucket)); bucket = []; }
+    }
+    bucket.push(k);
+    if (bucket.length === 4) { groups.push(buildSynthetic(bucket)); bucket = []; }
+  }
+  if (bucket.length > 0) groups.push(buildSynthetic(bucket));
+  return groups;
+}
+function buildSynthetic(bucket) {
+  return {
+    t: bucket[0].t,
+    h: Math.max(...bucket.map(k => k.h)),
+    l: Math.min(...bucket.map(k => k.l)),
+    c: bucket[bucket.length - 1].c,
+  };
+}
+
 async function fetchCandles(monitor, tfKey, cfg, sinceMs) {
   if (tfKey === "1h") return fetchYahooNative(monitor.yahooSymbol, "60m", cfg, sinceMs);
-  if (tfKey === "1d") return fetchYahooNative(monitor.yahooSymbol, "1d",  cfg, sinceMs);
+  if (tfKey === "1d") {
+    if (monitor.dailyAnchor === "ny17") {
+      // Vela diaria propia, cortada a las 17:00 NY — no la nativa de Yahoo.
+      const hourlyCfg = { seconds: 3600, limit: cfg.limit * 24 };
+      const hourly  = await fetchYahooNative(monitor.yahooSymbol, "60m", hourlyCfg, sinceMs);
+      const grouped = groupToForexDaily(hourly);
+      // Se descarta siempre el grupo del día de trading actual (todavía en curso).
+      const nowKey = nyTradingDayKey(Date.now());
+      const cerrados = grouped.filter(g => nyTradingDayKey(g.t) !== nowKey);
+      return sinceMs != null ? cerrados : cerrados.slice(-cfg.limit);
+    }
+    return fetchYahooNative(monitor.yahooSymbol, "1d", cfg, sinceMs);
+  }
   if (tfKey === "4h") {
     // Para tener suficientes velas de 1H como para armar "limit" grupos de 4H,
     // se pide histórico de 1H con una ventana 4x más amplia.
@@ -303,12 +375,40 @@ async function poll() {
   }
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   if (req.url === "/ping") {
     // Endpoint liviano para UptimeRobot/cron-job.org — solo confirma que
     // el servicio está despierto, sin el JSON pesado de /health.
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("OK");
+  } else if (req.url.startsWith("/debug-yahoo")) {
+    // Muestra las últimas velas crudas de Yahoo con su hora exacta, para
+    // comparar manualmente contra los límites de vela que usa TradingView.
+    // Ej: /debug-yahoo?symbol=EURUSD=X&interval=1d
+    try {
+      const u        = new URL(req.url, "http://localhost");
+      const symbol   = u.searchParams.get("symbol")   || "EURUSD=X";
+      const interval = u.searchParams.get("interval") || "1d";
+      const nowSec   = Math.floor(Date.now() / 1000);
+      const period1  = nowSec - 30 * 86400; // últimos 30 días, de sobra para comparar
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&period1=${period1}&period2=${nowSec}`;
+      const res2 = await fetchJSON(url);
+      const result = res2?.chart?.result?.[0];
+      const ts = result?.timestamp || [];
+      const quote = result?.indicators?.quote?.[0] || {};
+      const velas = ts.map((t, i) => ({
+        utc:   new Date(t * 1000).toISOString(),
+        ar:    horaAR(new Date(t * 1000)),
+        high:  quote.high?.[i],
+        low:   quote.low?.[i],
+        close: quote.close?.[i],
+      }));
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ urlConsultada: url, totalVelas: velas.length, ultimasVelas: velas.slice(-10) }, null, 2));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
   } else if (req.url === "/health" || req.url === "/") {
     const estado = [];
     for (const monitor of MONITORS) {
