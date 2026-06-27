@@ -133,6 +133,7 @@ async function fetchYahooNative(symbol, interval, cfg, sinceMs) {
   const candles = [];
   for (let i = 0; i < ts.length; i++) {
     if (high[i] == null || low[i] == null || close[i] == null) continue; // huecos (mercado cerrado)
+    if (high[i] === low[i] && low[i] === close[i]) continue; // vela "fantasma": precio repetido plano, mercado cerrado sin trading real
     const t = ts[i] * 1000;
     if (t + seconds * 1000 > nowMs) continue; // excluir vela en formación
     candles.push({ t, h: high[i], l: low[i], c: close[i] });
